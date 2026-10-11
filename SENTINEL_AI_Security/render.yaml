@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: sentinel-ai-security-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt && python ml/train_model.py
+    startCommand: gunicorn app:app --workers 2 --threads 4 --timeout 120
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: FRONTEND_ORIGIN
+        value: "*"
+      - key: SENTINEL_TRAIN_ROWS
+        value: "50000"
+  - type: web
+    name: sentinel-ai-security-web
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_URL
+        value: https://sentinel-ai-security-817u.onrender.com

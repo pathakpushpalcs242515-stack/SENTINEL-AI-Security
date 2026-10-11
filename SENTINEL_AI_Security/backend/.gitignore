@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.venv/
+data/*.db
+ml/models/*.joblib
+ml/models/metrics.json
