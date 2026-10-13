@@ -1,10 +1,10 @@
+
 node_modules/
 frontend/dist/
 backend/.venv/
 backend/__pycache__/
 backend/ml/__pycache__/
-backend/ml/models/*.joblib
-backend/ml/models/metrics.json
+# Keep the trained model and metrics tracked by Git
 backend/data/*.db
 .env
 .DS_Store
