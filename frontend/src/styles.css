@@ -33,3 +33,46 @@
   .choice-card h3 { font-size: 23px; }
   .promise-strip { font-size: 9px; }
 }
+
+.verification-box {
+  margin: 24px 0;
+  padding: 20px 22px;
+  background: var(--cream);
+  border: 1px solid var(--line);
+}
+
+.verification-box > .eyebrow {
+  margin-bottom: 14px;
+}
+
+.verification-grid {
+  display: grid;
+  grid-template-columns: minmax(120px, 170px) minmax(0, 1fr);
+  align-items: start;
+  column-gap: 18px;
+  row-gap: 10px;
+}
+
+.verification-grid > span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.verification-grid > strong {
+  min-width: 0;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 600px) {
+  .verification-box { padding: 16px; }
+  .verification-grid {
+    grid-template-columns: minmax(88px, 34%) minmax(0, 1fr);
+    column-gap: 12px;
+    row-gap: 9px;
+  }
+}
