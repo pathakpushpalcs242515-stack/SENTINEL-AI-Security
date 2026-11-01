@@ -8,3 +8,7 @@ backend/ml/__pycache__/
 backend/data/*.db
 .env
 .DS_Store
+
+*.zip
+
+*.zip

@@ -1,0 +1,1466 @@
+===== FILE: START_SENTINEL.bat =====
+@echo off
+setlocal
+cd /d "%~dp0"
+echo.
+echo  SENTINEL ^| AI SECURITY
+ echo ======================
+echo.
+where py >nul 2>nul
+if errorlevel 1 (
+  echo Python Launcher ^(py^) was not found. Install Python 3.11+ from python.org and enable Add Python to PATH.
+  pause
+  exit /b 1
+)
+where node >nul 2>nul
+if errorlevel 1 (
+  echo Node.js was not found. Install Node.js 20+ from nodejs.org, then run this file again.
+  pause
+  exit /b 1
+)
+if not exist "backend\.venv\Scripts\python.exe" (
+  echo Creating Python virtual environment...
+  py -3 -m venv backend\.venv
+  if errorlevel 1 (echo Could not create the Python environment. Ensure Python 3.11+ is installed.& pause & exit /b 1)
+)
+echo Installing backend requirements...
+call "backend\.venv\Scripts\python.exe" -m pip install --upgrade pip
+call "backend\.venv\Scripts\python.exe" -m pip install -r backend\requirements.txt
+if errorlevel 1 (echo Backend dependencies could not be installed. Check your internet connection.& pause & exit /b 1)
+if not exist "backend\ml\models\sentinel_url_model.joblib" (
+  echo.
+  echo Downloading the public UCI dataset and training the model. This may take several minutes...
+  pushd backend
+  call .venv\Scripts\python.exe ml\train_model.py
+  set TRAIN_EXIT=%errorlevel%
+  popd
+  if not "%TRAIN_EXIT%"=="0" (echo Model training failed. Read the error above, then try again.& pause & exit /b 1)
+)
+if not exist "frontend\node_modules" (
+  echo Installing frontend packages...
+  pushd frontend
+  call npm install
+  set NPM_EXIT=%errorlevel%
+  popd
+  if not "%NPM_EXIT%"=="0" (echo Frontend dependencies could not be installed. Check your internet connection.& pause & exit /b 1)
+)
+echo Starting the Python API in a new window...
+start "SENTINEL API" cmd /k "cd /d "%~dp0backend" ^&^& .venv\Scripts\python.exe app.py"
+echo Starting the website in a new window...
+start "SENTINEL WEB" cmd /k "cd /d "%~dp0frontend" ^&^& npm run dev"
+echo.
+echo When Vite starts, open the local URL shown in the website terminal (usually http://localhost:5173).
+echo Keep both terminal windows open while using SENTINEL.
+pause
+
+
+===== FILE: render.yaml =====
+services:
+  - type: web
+    name: sentinel-ai-security-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt && python ml/train_model.py
+    startCommand: gunicorn app:app --workers 2 --threads 4 --timeout 120
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: FRONTEND_ORIGIN
+        value: "*"
+      - key: SENTINEL_TRAIN_ROWS
+        value: "50000"
+  - type: web
+    name: sentinel-ai-security-web
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_URL
+        value: https://sentinel-ai-security-817u.onrender.com
+
+
+===== FILE: backend/requirements.txt =====
+Flask==3.1.0
+Flask-Cors==5.0.0
+gunicorn==23.0.0
+joblib==1.4.2
+numpy==2.2.1
+pandas==2.2.3
+scikit-learn==1.6.0
+ucimlrepo==0.0.7
+
+
+===== FILE: backend/app.py =====
+
+import json
+import os
+import socket
+import sqlite3
+import ssl
+import sys
+from pathlib import Path
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+from urllib.parse import urlsplit
+
+import joblib
+import pandas as pd
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+
+BASE_DIR = Path(__file__).resolve().parent
+ML_DIR = BASE_DIR / "ml"
+MODEL_DIR = ML_DIR / "models"
+MODEL_PATH = MODEL_DIR / "sentinel_url_model.joblib"
+METRICS_PATH = MODEL_DIR / "metrics.json"
+DB_DIR = BASE_DIR / "data"
+DB_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DB_DIR / "sentinel.db"
+
+sys.path.insert(0, str(BASE_DIR))
+from ml.features import FEATURE_NAMES, explain_features, extract_features
+
+app = Flask(__name__)
+app.config["JSON_SORT_KEYS"] = False
+
+allowed_origins = os.getenv("FRONTEND_ORIGIN", "*")
+if allowed_origins and allowed_origins.strip() != "*":
+    allowed_origins = [origin.strip() for origin in allowed_origins.split(",") if origin.strip()]
+else:
+    allowed_origins = "*"
+CORS(app, resources={r"/api/*": {"origins": allowed_origins}}, supports_credentials=True)
+
+MODEL_BUNDLE = None
+MODEL_LOAD_ERROR = None
+MODEL_INFO = {}
+
+
+def load_model():
+    global MODEL_BUNDLE, MODEL_LOAD_ERROR, MODEL_INFO
+    try:
+        if not MODEL_PATH.exists():
+            MODEL_BUNDLE = None
+            MODEL_LOAD_ERROR = f"Model is missing at {MODEL_PATH}. Run: python ml/train_model.py"
+            return
+
+        bundle = joblib.load(MODEL_PATH)
+        if isinstance(bundle, dict):
+            MODEL_BUNDLE = bundle.get("model")
+            MODEL_INFO = bundle.get("metrics", {})
+        else:
+            MODEL_BUNDLE = bundle
+            MODEL_INFO = {}
+
+        if MODEL_INFO:
+            try:
+                MODEL_INFO["dataset"] = MODEL_INFO.get("dataset") or json.loads(METRICS_PATH.read_text(encoding="utf-8"))["dataset"]
+            except Exception:
+                pass
+
+        MODEL_LOAD_ERROR = None
+    except Exception as exc:  # pragma: no cover - runtime driven by model presence
+        MODEL_BUNDLE = None
+        MODEL_LOAD_ERROR = str(exc)
+
+
+load_model()
+
+
+def ensure_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            url TEXT NOT NULL,
+            hostname TEXT NOT NULL,
+            risk_level TEXT NOT NULL,
+            risk_score INTEGER NOT NULL,
+            confidence INTEGER NOT NULL,
+            verdict TEXT NOT NULL,
+            model TEXT NOT NULL,
+            reasons TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+ensure_db()
+
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def normalize_url(raw_url):
+    if raw_url is None:
+        raise ValueError("A URL is required.")
+
+    candidate = str(raw_url).strip()
+    if not candidate:
+        raise ValueError("A URL is required.")
+
+    if "://" not in candidate:
+        candidate = f"https://{candidate}"
+
+    parsed = urlsplit(candidate)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("Please provide a valid HTTP or HTTPS URL.")
+
+    return parsed.geturl()
+
+
+def score_to_risk(score):
+    if score >= 70:
+        return "HIGH"
+    if score >= 30:
+        return "MODERATE"
+    return "LOW"
+
+
+def is_clean_public_domain(hostname: str) -> bool:
+    if not hostname:
+        return False
+    labels = [part for part in hostname.split(".") if part]
+    if len(labels) < 2:
+        return False
+    if hostname.startswith("xn--"):
+        return False
+    if any(part in {"localhost", "local", "internal", "test", "example"} for part in labels):
+        return True
+    if any(token in hostname for token in ["login", "signin", "verify", "secure", "update", "payment", "confirm", "account", "bank", "wallet", "recover", "suspended", "credential"]):
+        return False
+    if hostname.count("-") >= 2 or len(hostname) > 45 or hostname.count(".") > 3:
+        return False
+    return True
+
+
+def verify_real_url(url: str):
+    parsed = urlsplit(url)
+    hostname = (parsed.hostname or "").lower()
+    result = {
+        "dnsResolved": False,
+        "reachable": False,
+        "tlsValid": False,
+        "httpStatus": None,
+        "redirectedTo": None,
+        "finalUrl": url,
+        "error": None,
+    }
+
+    if not hostname:
+        result["error"] = "No hostname was found in the provided URL."
+        return result
+
+    try:
+        socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme.lower() == "https" else 80), type=socket.SOCK_STREAM)
+        result["dnsResolved"] = True
+    except socket.gaierror as exc:
+        result["error"] = f"DNS resolution failed: {exc}"
+        return result
+
+    try:
+        ctx = ssl.create_default_context()
+        req = urllib_request.Request(url, method="HEAD")
+        with urllib_request.urlopen(req, timeout=5, context=ctx) as response:
+            result["reachable"] = True
+            result["httpStatus"] = getattr(response, "status", None)
+            result["finalUrl"] = response.geturl() or url
+            result["redirectedTo"] = response.geturl() if response.geturl() != url else None
+            result["tlsValid"] = True
+    except urllib_error.HTTPError as exc:
+        result["reachable"] = True
+        result["httpStatus"] = getattr(exc, "code", None)
+        result["finalUrl"] = exc.geturl() or url
+        result["redirectedTo"] = exc.geturl() if exc.geturl() and exc.geturl() != url else None
+        result["tlsValid"] = True
+    except Exception:
+        try:
+            req = urllib_request.Request(url, method="GET")
+            with urllib_request.urlopen(req, timeout=5, context=ssl.create_default_context()) as response:
+                result["reachable"] = True
+                result["httpStatus"] = getattr(response, "status", None)
+                result["finalUrl"] = response.geturl() or url
+                result["redirectedTo"] = response.geturl() if response.geturl() != url else None
+                result["tlsValid"] = True
+        except urllib_error.HTTPError as exc:
+            result["reachable"] = True
+            result["httpStatus"] = getattr(exc, "code", None)
+            result["finalUrl"] = exc.geturl() or url
+            result["redirectedTo"] = exc.geturl() if exc.geturl() and exc.geturl() != url else None
+            result["tlsValid"] = True
+        except Exception as exc:
+            result["error"] = str(exc)
+            if parsed.scheme.lower() == "https":
+                result["tlsValid"] = False
+
+    return result
+
+
+def build_scan_result(url):
+    if MODEL_BUNDLE is None:
+        raise RuntimeError(MODEL_LOAD_ERROR or "The phishing model is not available.")
+
+    feature_values = extract_features(url)
+    feature_row = pd.DataFrame([feature_values], columns=FEATURE_NAMES)
+    probabilities = MODEL_BUNDLE.predict_proba(feature_row)[0]
+    classes = list(getattr(MODEL_BUNDLE, "classes_", [0, 1]))
+
+    phishing_index = 1 if 1 in classes else (len(classes) - 1)
+    phishing_probability = float(probabilities[phishing_index])
+    parsed = urlsplit(url)
+    hostname = (parsed.hostname or "unknown").lower()
+    reasons = explain_features(url)
+    real_check = verify_real_url(url)
+
+    risk_score = max(0, min(100, round(phishing_probability * 100)))
+    if real_check.get("dnsResolved") and real_check.get("reachable") and real_check.get("tlsValid"):
+        risk_score = max(0, risk_score - 35)
+    if is_clean_public_domain(hostname) and not any(token in hostname for token in ["login", "signin", "verify", "secure", "update", "payment", "confirm", "account", "bank", "wallet", "recover", "suspended", "credential"]):
+        risk_score = min(risk_score, 25)
+    if not real_check.get("dnsResolved") or not real_check.get("reachable"):
+        risk_score = max(risk_score, 60)
+
+    confidence = max(0, min(100, round(float(max(probabilities)) * 100)))
+
+    if risk_score >= 70:
+        verdict = "This link looks highly suspicious and is likely a phishing or malicious destination."
+    elif risk_score >= 30:
+        verdict = "This link shows moderate risk indicators, so it should be checked carefully before login or payment actions."
+    else:
+        verdict = "This link does not show strong phishing indicators and the domain appears to be reachable and legitimate on basic inspection."
+
+    return {
+        "url": url,
+        "hostname": hostname,
+        "riskScore": risk_score,
+        "riskLevel": score_to_risk(risk_score),
+        "confidence": confidence,
+        "model": "Random Forest",
+        "verdict": verdict,
+        "reasons": reasons,
+        "realCheck": real_check,
+    }
+
+
+@app.route("/api/health", methods=["GET"])
+def health_check():
+    return jsonify({
+        "status": "ok",
+        "database": "ready",
+        "dbPath": str(DB_PATH),
+        "modelReady": MODEL_BUNDLE is not None,
+        "model": "Random Forest" if MODEL_BUNDLE is not None else None,
+        "error": MODEL_LOAD_ERROR,
+    })
+
+
+@app.route("/api/model", methods=["GET"])
+def model_status():
+    return jsonify({
+        "ready": MODEL_BUNDLE is not None,
+        "model": "Random Forest" if MODEL_BUNDLE is not None else None,
+        "modelPath": str(MODEL_PATH),
+        "modelFileExists": MODEL_PATH.is_file(),
+        "error": MODEL_LOAD_ERROR,
+    }), 200 if MODEL_BUNDLE is not None else 503
+
+
+@app.route("/api/scan", methods=["POST"])
+def scan_url():
+    payload = request.get_json(silent=True) or {}
+    raw_url = payload.get("url") or request.form.get("url")
+
+    try:
+        url = normalize_url(raw_url)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    try:
+        result = build_scan_result(url)
+    except Exception as exc:  # pragma: no cover - model availability is runtime checked
+        return jsonify({"error": str(exc)}), 503
+
+    user_id = request.headers.get("X-Sentinel-User") or "anonymous"
+    reasons_json = json.dumps(result["reasons"], ensure_ascii=False)
+
+    conn = get_db_connection()
+    conn.execute(
+        """
+        INSERT INTO scans (user_id, url, hostname, risk_level, risk_score, confidence, verdict, model, reasons)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            url,
+            result["hostname"],
+            result["riskLevel"],
+            result["riskScore"],
+            result["confidence"],
+            result["verdict"],
+            result["model"],
+            reasons_json,
+        ),
+    )
+    conn.commit()
+    last_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+    conn.close()
+
+    result["id"] = last_id
+    result["createdAt"] = __import__("datetime").datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    return jsonify({"scan": result, "status": "ok"})
+
+
+@app.route("/api/scans", methods=["GET"])
+def list_scans():
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except ValueError:
+        limit = 20
+    limit = max(1, min(limit, 200))
+    user_id = request.headers.get("X-Sentinel-User")
+
+    conn = get_db_connection()
+    if user_id:
+        rows = conn.execute(
+            "SELECT * FROM scans WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM scans ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    scans = []
+    for row in rows:
+        scans.append({
+            "id": row["id"],
+            "userId": row["user_id"],
+            "url": row["url"],
+            "hostname": row["hostname"],
+            "riskLevel": row["risk_level"],
+            "riskScore": row["risk_score"],
+            "confidence": row["confidence"],
+            "verdict": row["verdict"],
+            "model": row["model"],
+            "reasons": json.loads(row["reasons"] or "[]"),
+            "createdAt": row["created_at"],
+        })
+    conn.close()
+    return jsonify({"scans": scans})
+
+
+@app.route("/api/scans", methods=["DELETE"])
+def clear_scans():
+    conn = get_db_connection()
+    user_id = request.headers.get("X-Sentinel-User")
+    if user_id:
+        conn.execute("DELETE FROM scans WHERE user_id = ?", (user_id,))
+    else:
+        conn.execute("DELETE FROM scans")
+    conn.commit()
+    conn.close()
+    return jsonify({"deleted": True})
+
+
+@app.route("/api/model-info", methods=["GET"])
+def model_info():
+    try:
+        metrics = json.loads(METRICS_PATH.read_text(encoding="utf-8")) if METRICS_PATH.exists() else {}
+    except Exception:
+        metrics = {}
+    if MODEL_INFO:
+        metrics.update(MODEL_INFO)
+    if not metrics:
+        return jsonify({"error": "Model metrics are not available yet."}), 503
+    return jsonify(metrics)
+
+
+if __name__ == "__main__":
+    ensure_db()
+    load_model()
+    app.run(host="0.0.0.0", port=5000, debug=False)
+
+
+===== FILE: backend/ml/__init__.py =====
+"""Machine learning utilities for SENTINEL."""
+
+
+===== FILE: backend/ml/features.py =====
+"""Lexical URL feature extraction shared by training and inference."""
+from collections import Counter
+from math import log2
+from urllib.parse import urlsplit
+import ipaddress
+import re
+
+SHORTENERS = {
+    "bit.ly", "tinyurl.com", "t.co", "is.gd", "ow.ly", "buff.ly",
+    "cutt.ly", "rb.gy", "shorturl.at", "rebrand.ly", "tiny.cc", "lnkd.in"
+}
+SUSPICIOUS_TERMS = (
+    "login", "signin", "verify", "secure", "account", "update", "password",
+    "wallet", "gift", "payment", "urgent", "confirm", "auth", "banking",
+    "recover", "suspended", "webscr", "credential", "invoice", "support"
+)
+FEATURE_NAMES = [
+    "url_length", "hostname_length", "path_length", "query_length", "tld_length",
+    "count_dots", "count_hyphens", "count_underscores", "count_slashes", "count_at",
+    "count_question", "count_equal", "count_ampersand", "count_percent", "count_digits",
+    "digit_ratio", "count_subdomains", "has_ip", "uses_https", "has_punycode",
+    "has_port", "has_userinfo", "suspicious_keyword_count", "is_shortener",
+    "hostname_entropy", "has_double_slash_path", "count_letters", "special_char_ratio"
+]
+
+def extract_features(raw_url: str) -> dict:
+    raw = str(raw_url).strip()
+    candidate = raw if "://" in raw else "http://" + raw
+    try:
+        parsed = urlsplit(candidate)
+        host = (parsed.hostname or "").lower().strip(".")
+        path = parsed.path or ""
+        query = parsed.query or ""
+        port = parsed.port
+        userinfo = bool(parsed.username or parsed.password)
+    except (ValueError, UnicodeError):
+        host, path, query, port, userinfo = "", "", "", None, False
+        parsed = urlsplit("http://invalid.invalid")
+    labels = [part for part in host.split(".") if part]
+    try:
+        ipaddress.ip_address(host)
+        is_ip = 1
+    except ValueError:
+        is_ip = 0
+    counts = Counter(raw.lower())
+    letters = sum(ch.isalpha() for ch in raw)
+    digits = sum(ch.isdigit() for ch in raw)
+    specials = sum(not ch.isalnum() for ch in raw)
+    freq = Counter(host)
+    entropy = -sum((n / max(1, len(host))) * log2(n / max(1, len(host))) for n in freq.values()) if host else 0.0
+    terms = sum(1 for term in SUSPICIOUS_TERMS if term in raw.lower())
+    tld = labels[-1] if len(labels) > 1 else ""
+    path_after_host = path.lstrip("/")
+    return {
+        "url_length": len(raw), "hostname_length": len(host), "path_length": len(path),
+        "query_length": len(query), "tld_length": len(tld), "count_dots": counts["."],
+        "count_hyphens": counts["-"], "count_underscores": counts["_"],
+        "count_slashes": counts["/"], "count_at": counts["@"], "count_question": counts["?"],
+        "count_equal": counts["="], "count_ampersand": counts["&"], "count_percent": counts["%"],
+        "count_digits": digits, "digit_ratio": digits / max(1, len(raw)),
+        "count_subdomains": max(0, len(labels) - 2), "has_ip": is_ip,
+        "uses_https": int(parsed.scheme.lower() == "https"),
+        "has_punycode": int("xn--" in host), "has_port": int(port is not None),
+        "has_userinfo": int(userinfo), "suspicious_keyword_count": terms,
+        "is_shortener": int(host in SHORTENERS), "hostname_entropy": entropy,
+        "has_double_slash_path": int("//" in path_after_host), "count_letters": letters,
+        "special_char_ratio": specials / max(1, len(raw)),
+    }
+
+def explain_features(raw_url: str) -> list[str]:
+    f = extract_features(raw_url)
+    candidate = raw_url if "://" in raw_url else "http://" + raw_url
+    parsed = urlsplit(candidate)
+    host = (parsed.hostname or "").lower()
+    reasons = []
+    if not f["uses_https"]: reasons.append("The URL does not use HTTPS.")
+    if f["has_ip"]: reasons.append("The hostname is a raw IP address rather than a domain name.")
+    if f["has_punycode"]: reasons.append("The domain contains punycode, which can represent look-alike characters.")
+    if f["count_subdomains"] >= 3: reasons.append("The hostname contains several subdomain levels.")
+    if f["has_userinfo"]: reasons.append("The URL contains embedded username or password information.")
+    if f["is_shortener"]: reasons.append("The domain is a URL shortener, so the destination is not obvious from the link.")
+    terms = [term for term in SUSPICIOUS_TERMS if term in raw_url.lower()]
+    if terms: reasons.append("The URL contains potentially sensitive or urgency-related terms: " + ", ".join(terms[:5]) + ".")
+    if len(raw_url) > 180: reasons.append("The URL is unusually long.")
+    if host.count("-") >= 3: reasons.append("The hostname contains several hyphens.")
+    if not reasons: reasons.append("No obvious lexical warning signs were detected; this does not prove the destination is safe.")
+    return reasons
+
+
+===== FILE: backend/ml/train_model.py =====
+"""Download the public UCI PhiUSIIL dataset, train and evaluate a URL-only classifier.
+
+UCI dataset: https://archive.ics.uci.edu/dataset/967/phiusiil+phishing+url+dataset
+Target definition in UCI: 1 = legitimate, 0 = phishing.
+This script uses only the raw URL column and recomputes lexical features to avoid
+relying on precomputed dataset features at inference time.
+"""
+import json
+import os
+from pathlib import Path
+import sys
+
+import joblib
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, VotingClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score
+from sklearn.model_selection import train_test_split
+
+HERE = Path(__file__).resolve().parent
+MODEL_DIR = HERE / "models"
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+sys.path.insert(0, str(HERE))
+from features import FEATURE_NAMES, extract_features
+
+MAX_ROWS = int(os.getenv("SENTINEL_TRAIN_ROWS", "50000"))
+RANDOM_STATE = 42
+
+def load_dataset():
+    local = os.getenv("SENTINEL_DATASET_CSV")
+    if local and Path(local).exists():
+        df = pd.read_csv(local)
+        url_col = next((c for c in df.columns if c.lower() == "url"), None)
+        label_col = next((c for c in df.columns if c.lower() in {"label", "status", "result", "target"}), None)
+        if not url_col or not label_col:
+            raise ValueError("Local CSV must contain URL and label columns.")
+        return df[[url_col, label_col]].rename(columns={url_col: "URL", label_col: "label"})
+    from ucimlrepo import fetch_ucirepo
+    print("Downloading PhiUSIIL Phishing URL dataset from UCI…", flush=True)
+    dataset = fetch_ucirepo(id=967)
+    X, y = dataset.data.features, dataset.data.targets
+    url_col = next((c for c in X.columns if c.lower() == "url"), None)
+    if not url_col:
+        raise ValueError("The UCI dataset did not expose a raw URL column.")
+    target_col = y.columns[0]
+    return pd.DataFrame({"URL": X[url_col].astype(str), "label": y[target_col]})
+
+def normalize_phishing_label(series):
+    # UCI PhiUSIIL labels: 1 legitimate, 0 phishing. Other CSV labels are accepted
+    # if they are recognizable; numeric binary CSV labels default to 1=phishing.
+    vals = set(series.dropna().astype(str).str.strip().str.lower().unique())
+    if vals and vals.issubset({"0", "1", "0.0", "1.0"}):
+        return (pd.to_numeric(series) == 0).astype(int)
+    mapping = {"phishing": 1, "malicious": 1, "bad": 1, "unsafe": 1,
+               "legitimate": 0, "benign": 0, "good": 0, "safe": 0,
+               "phish": 1, "1": 1, "0": 0}
+    normalized = series.astype(str).str.strip().str.lower().map(mapping)
+    if normalized.isna().any():
+        raise ValueError("Labels must identify phishing/malicious vs legitimate/benign URLs.")
+    return normalized.astype(int)
+
+def main():
+    df = load_dataset().dropna(subset=["URL", "label"]).copy()
+    df["URL"] = df["URL"].astype(str).str.strip()
+    df = df[df["URL"].str.len().between(4, 2048)].drop_duplicates(subset=["URL"])
+    df["target"] = normalize_phishing_label(df["label"])
+    if len(df) > MAX_ROWS:
+        # Stratified sample preserves both classes while keeping deployment build time reasonable.
+        df, _ = train_test_split(df, train_size=MAX_ROWS, random_state=RANDOM_STATE, stratify=df["target"])
+    print(f"Training on {len(df):,} unique URLs; phishing={int(df.target.sum()):,}, legitimate={int((1-df.target).sum()):,}", flush=True)
+    feature_rows = [extract_features(url) for url in df["URL"].tolist()]
+    X = pd.DataFrame(feature_rows, columns=FEATURE_NAMES).fillna(0)
+    y = df["target"].astype(int)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y)
+    model = RandomForestClassifier(n_estimators=120, max_depth=24, min_samples_leaf=2,
+        class_weight="balanced_subsample", n_jobs=2, random_state=RANDOM_STATE)
+    model.fit(X_train, y_train)
+    pred = model.predict(X_test)
+    proba = model.predict_proba(X_test)[:, 1]
+    metrics = {
+        "dataset": "UCI PhiUSIIL Phishing URL Dataset (URL-only re-engineered features)",
+        "datasetSource": "https://archive.ics.uci.edu/dataset/967/phiusiil+phishing+url+dataset",
+        "rowsUsed": int(len(df)), "phishingRows": int(y.sum()), "legitimateRows": int((1-y).sum()),
+        "trainRows": int(len(X_train)), "testRows": int(len(X_test)),
+        "accuracy": round(float(accuracy_score(y_test, pred)), 4),
+        "precision": round(float(precision_score(y_test, pred, zero_division=0)), 4),
+        "recall": round(float(recall_score(y_test, pred, zero_division=0)), 4),
+        "f1": round(float(f1_score(y_test, pred, zero_division=0)), 4),
+        "rocAuc": round(float(roc_auc_score(y_test, proba)), 4),
+        "confusionMatrix": confusion_matrix(y_test, pred).tolist(),
+        "featureCount": len(FEATURE_NAMES), "model": "Random Forest", "randomState": RANDOM_STATE,
+    }
+    joblib.dump({"model": model, "feature_names": FEATURE_NAMES, "metrics": metrics}, MODEL_DIR / "sentinel_url_model.joblib", compress=3)
+    (MODEL_DIR / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    print(json.dumps(metrics, indent=2), flush=True)
+    print(f"Saved model to {MODEL_DIR / 'sentinel_url_model.joblib'}", flush=True)
+
+if __name__ == "__main__":
+    main()
+
+
+===== FILE: frontend/index.html =====
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f1e8da" />
+    <meta name="description" content="SENTINEL AI Security — assess suspicious URLs and QR-code links before you open them." />
+    <title>SENTINEL | AI Security</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+
+
+===== FILE: frontend/package.json =====
+{
+  "name": "smart-phishing-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "lucide-react": "^0.468.0",
+    "html5-qrcode": "^2.3.8",
+    "react-router-dom": "^7.1.1"
+  },
+  "devDependencies": {}
+}
+
+
+===== FILE: frontend/vite.config.js =====
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  server: { port: 5173, strictPort: false }
+});
+
+
+===== FILE: frontend/src/main.jsx =====
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import { BrowserRouter } from 'react-router-dom';
+import App from './App.jsx';
+import './styles.css';
+
+createRoot(document.getElementById('root')).render(
+  <React.StrictMode><BrowserRouter><App /></BrowserRouter></React.StrictMode>
+);
+
+
+===== FILE: frontend/src/App.jsx =====
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Link, NavLink, Route, Routes } from 'react-router-dom';
+import { ArrowRight, Camera, Check, CircleAlert, Clock3, ExternalLink, History, Link2, LoaderCircle, LockKeyhole, ScanLine, ShieldCheck, Sparkles, Trash2, Upload } from 'lucide-react';
+import { Html5Qrcode } from 'html5-qrcode';
+
+const API = (import.meta.env.VITE_API_URL || 'http://localhost:5000').replace(/\/$/, '');
+const USER_KEY = 'sentinel-browser-user-id';
+
+function getUserId() {
+  try {
+    let id = localStorage.getItem(USER_KEY);
+    if (!id) {
+      id = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      localStorage.setItem(USER_KEY, id);
+    }
+    return id;
+  } catch {
+    return 'session-' + Math.random().toString(36).slice(2);
+  }
+}
+
+const userHeaders = () => ({ 'X-Sentinel-User': getUserId() });
+const riskClass = (level) => (level || 'moderate').toLowerCase();
+
+function Header() {
+  return (
+    <header className="site-header">
+      <Link className="wordmark" to="/" aria-label="Sentinel home"><span>SENTINEL</span><i /> <small>AI SECURITY</small></Link>
+      <nav>
+        <NavLink to="/" end>Home</NavLink>
+        <NavLink to="/scan-url">Scan URL</NavLink>
+        <NavLink to="/scan-qr">Scan QR</NavLink>
+        <NavLink to="/history">History</NavLink>
+        <NavLink to="/model">Model</NavLink>
+      </nav>
+    </header>
+  );
+}
+
+function Footer() {
+  return (
+    <footer className="site-footer">
+      <span>SENTINEL <i>·</i> AI SECURITY</span>
+      <span>Pause. Scan. Proceed.</span>
+      <span>URL-pattern analysis is an indicator, not a guarantee.</span>
+    </footer>
+  );
+}
+
+function Layout({ children, wide = false }) {
+  return (
+    <div className="app">
+      <Header />
+      <main className={wide ? 'page-main page-main-wide' : 'page-main'}>{children}</main>
+      <Footer />
+    </div>
+  );
+}
+
+function Home() {
+  return (
+    <Layout wide>
+      <section className="home-hero" style={{ backgroundImage: "linear-gradient(90deg, rgba(239,226,207,.94) 0%, rgba(239,226,207,.84) 42%, rgba(239,226,207,.05) 75%), url('/images/home-beige.png')" }}>
+        <div className="home-copy">
+          <p className="eyebrow"><span className="eyebrow-line" /> DIGITAL CLARITY, BEFORE THE CLICK</p>
+          <h1>Know what’s<br />behind <em>the link.</em></h1>
+          <p className="home-subtitle">Intelligent protection, before the click.</p>
+          <p className="home-description">A considered way to check suspicious links and QR codes. Let SENTINEL assess the URL before you decide to trust it.</p>
+          <div className="home-actions">
+            <Link className="button button-dark" to="/scan-url"><Link2 size={17} /> SCAN URL <ArrowRight size={16} /></Link>
+            <Link className="button button-light" to="/scan-qr"><ScanLine size={17} /> SCAN QR <ArrowRight size={16} /></Link>
+          </div>
+          <p className="formal-title">SMART PHISHING &amp; MALICIOUS URL DETECTOR</p>
+        </div>
+        <div className="home-photo-caption"><span>01 / DIGITAL AWARENESS</span><span>Smarter checks. Safer choices.</span></div>
+      </section>
+      <section className="home-intro">
+        <div>
+          <p className="eyebrow">A MORE THOUGHTFUL FIRST STEP</p>
+          <h2>Every link deserves<br /><em>a closer look.</em></h2>
+        </div>
+        <p>Suspicious links can be carefully disguised. SENTINEL uses a trained machine-learning model to examine URL patterns, estimate phishing risk, and explain the visible warning signs — without opening the destination.</p>
+      </section>
+      <section className="promise-strip">
+        <span><ShieldCheck size={17} /> URL-only ML analysis</span>
+        <span><LockKeyhole size={17} /> The destination is not opened</span>
+        <span><History size={17} /> Saved scan history</span>
+      </section>
+    </Layout>
+  );
+}
+
+function ResultCard({ result, onReset }) {
+  if (!result) return null;
+  const cls = riskClass(result.riskLevel);
+  const realCheck = result.realCheck || {};
+
+  return (
+    <section className="result-card" aria-live="polite">
+      <div className="result-top">
+        <div>
+          <p className="eyebrow">SENTINEL SECURITY ASSESSMENT</p>
+          <h2>{result.riskLevel === 'LOW' ? 'Lower risk detected' : result.riskLevel === 'MODERATE' ? 'Review this link carefully' : 'High risk detected'}</h2>
+          <p className="result-host">{result.hostname}</p>
+          <p className="result-verdict">{result.verdict}</p>
+        </div>
+        <div className={`score-ring ${cls}`}><strong>{result.riskScore}%</strong><span>PHISHING RISK</span></div>
+      </div>
+
+      <div className="score-track"><span className={cls} style={{ width: `${result.riskScore}%` }} /></div>
+
+      <div className="result-stats">
+        <div><span>RISK LEVEL</span><strong className={`risk-text ${cls}`}>{result.riskLevel}</strong></div>
+        <div><span>MODEL CONFIDENCE</span><strong>{result.confidence ?? '—'}%</strong></div>
+        <div><span>MODEL</span><strong>{result.model || 'Random Forest'}</strong></div>
+      </div>
+
+      {realCheck && (
+        <div className="verification-box">
+          <p className="eyebrow">REAL VERIFICATION</p>
+          <div className="verification-grid">
+            <span>DNS resolved</span><strong>{realCheck.dnsResolved ? 'Yes' : 'No'}</strong>
+            <span>Reachable</span><strong>{realCheck.reachable ? 'Yes' : 'No'}</strong>
+            <span>HTTPS valid</span><strong>{realCheck.tlsValid ? 'Yes' : 'No'}</strong>
+            <span>HTTP status</span><strong>{realCheck.httpStatus ?? 'Unavailable'}</strong>
+            <span>Final URL</span><strong>{realCheck.finalUrl || result.url}</strong>
+            {realCheck.redirectedTo ? <><span>Redirect</span><strong>{realCheck.redirectedTo}</strong></> : null}
+            {realCheck.error ? <><span>Note</span><strong>{realCheck.error}</strong></> : null}
+          </div>
+        </div>
+      )}
+
+      <div className="signals-heading">
+        <div>
+          <p className="eyebrow">OBSERVED CHARACTERISTICS</p>
+          <h3>Why it may need attention</h3>
+        </div>
+        <span className="muted-small">URL pattern indicators</span>
+      </div>
+
+      <ul className="reason-list">
+        {(result.reasons || []).map((reason, i) => (
+          <li key={i}><span><CircleAlert size={15} /></span>{reason}</li>
+        ))}
+      </ul>
+
+      <div className="recommendation">
+        <ShieldCheck size={20} />
+        <div>
+          <strong>Before you proceed</strong>
+          <p>
+            {result.riskScore >= 65
+              ? 'Avoid entering passwords, payment details, or personal information. Verify the sender and domain independently.'
+              : result.riskScore >= 30
+                ? 'Treat the link cautiously. Confirm the domain with the organization through a trusted channel before sharing sensitive information.'
+                : 'No strong phishing pattern was detected, but a low score cannot guarantee a website is safe.'}
+          </p>
+        </div>
+      </div>
+
+      <p className="result-disclaimer">This prediction is based on URL characteristics and a live basic connectivity check. It is not a full domain reputation lookup and should be treated as a signal, not a guarantee.</p>
+      <button className="button button-dark reset-button" onClick={onReset}>SCAN ANOTHER <ArrowRight size={16} /></button>
+    </section>
+  );
+}
+
+function useScan() {
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState('');
+  const requestId = useRef(0);
+
+  const analyzeUrl = useCallback(async (url) => {
+    const currentRequestId = ++requestId.current;
+    setLoading(true);
+    setError('');
+    setResult(null);
+    try {
+      const response = await fetch(`${API}/api/scan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...userHeaders() },
+        body: JSON.stringify({ url }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Analysis failed.');
+      if (!data.scan?.realCheck) {
+        throw new Error('The backend is outdated. Restart the SENTINEL API, then scan again.');
+      }
+      if (requestId.current === currentRequestId) setResult(data.scan);
+    } catch (e) {
+      if (requestId.current === currentRequestId) {
+        setError(e.message || 'Could not connect to the SENTINEL API.');
+      }
+    } finally {
+      if (requestId.current === currentRequestId) setLoading(false);
+    }
+  }, []);
+
+  const reset = useCallback(() => {
+    requestId.current += 1;
+    setLoading(false);
+    setResult(null);
+    setError('');
+  }, []);
+
+  return { loading, result, error, analyzeUrl, reset };
+}
+
+function UrlScanPage() {
+  const [url, setUrl] = useState('');
+  const scan = useScan();
+
+  function submit(e) {
+    e.preventDefault();
+    let parsed;
+    try {
+      parsed = new URL(url.trim().includes('://') ? url.trim() : `https://${url.trim()}`);
+    } catch {
+      return;
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname.includes('.')) return;
+    scan.analyzeUrl(parsed.href);
+  }
+
+  return (
+    <Layout wide>
+      <section className="scan-hero url-hero" style={{ backgroundImage: "linear-gradient(90deg, rgba(29,22,16,.93) 0%, rgba(29,22,16,.78) 42%, rgba(29,22,16,.12) 100%), url('/images/url-editorial.png')" }}>
+        <div className="scan-hero-copy">
+          <p className="eyebrow eyebrow-light"><span className="eyebrow-line" /> URL SCAN / 01</p>
+          <h1>Not every link<br />is what it <em>seems.</em></h1>
+          <p>Smart Phishing &amp; Malicious URL Detector</p>
+          <form className="url-form" onSubmit={submit}>
+            <Link2 size={20} />
+            <input aria-label="Website URL" type="text" value={url} onChange={e => { setUrl(e.target.value); scan.reset(); }} placeholder="Paste a website URL…" maxLength={2048} required />
+            <button disabled={scan.loading}>{scan.loading ? <LoaderCircle className="spin" size={17} /> : 'SCAN URL'} <ArrowRight size={16} /></button>
+          </form>
+          <p className="scan-note"><LockKeyhole size={14} /> The destination is never opened automatically.</p>
+        </div>
+        <div className="image-label">SENTINEL / URL INTELLIGENCE</div>
+      </section>
+
+      {scan.error && <div className="notice error" role="alert">{scan.error}</div>}
+      {scan.loading && <div className="loading-panel"><LoaderCircle className="spin" /> Extracting URL characteristics and checking the host in real time…</div>}
+      <ResultCard result={scan.result} onReset={() => { scan.reset(); setUrl(''); }} />
+      <div className="scan-bottom"><span>01 / URL STRUCTURE</span><span>02 / MODEL INFERENCE</span><span>03 / RISK ASSESSMENT</span></div>
+    </Layout>
+  );
+}
+
+function QrScanPage() {
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const [cameraError, setCameraError] = useState('');
+  const [qrValue, setQrValue] = useState('');
+  const [fileBusy, setFileBusy] = useState(false);
+  const scannerRef = useRef(null);
+  const scan = useScan();
+
+  useEffect(() => {
+    if (!cameraOpen) return undefined;
+    let cancelled = false;
+    let scanner;
+
+    (async () => {
+      try {
+        scanner = new Html5Qrcode('sentinel-qr-reader');
+        scannerRef.current = scanner;
+        await scanner.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 230, height: 230 }, aspectRatio: 1 }, async (decoded) => {
+          if (cancelled) return;
+          setQrValue(decoded);
+          setCameraError('');
+          setCameraOpen(false);
+          try {
+            const parsed = new URL(decoded.trim());
+            if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error();
+            scan.analyzeUrl(parsed.href);
+          } catch {
+            setCameraError('This QR code does not contain a valid HTTP or HTTPS URL.');
+          }
+        }, () => {});
+      } catch {
+        if (!cancelled) {
+          setCameraError('Camera unavailable. Allow camera access or upload a QR image instead.');
+          setCameraOpen(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      const current = scannerRef.current;
+      scannerRef.current = null;
+      if (current) {
+        (async () => {
+          try { if (current.isScanning) await current.stop(); } catch {}
+          try { current.clear(); } catch {}
+        })();
+      }
+    };
+    // scan is stable for the page lifetime; intentionally do not restart camera on result changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cameraOpen]);
+
+  async function uploadFile(file) {
+    if (!file) return;
+    setCameraError('');
+    setFileBusy(true);
+    let scanner;
+    try {
+      scanner = new Html5Qrcode('sentinel-qr-reader');
+      const decoded = await scanner.scanFile(file, true);
+      setQrValue(decoded);
+      const parsed = new URL(decoded.trim());
+      if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('The QR code does not contain an HTTP or HTTPS URL.');
+      scan.analyzeUrl(parsed.href);
+    } catch (e) {
+      setCameraError(e.message || 'Could not read a QR code from that image. Try a clearer image.');
+    } finally {
+      try { scanner?.clear(); } catch {}
+      setFileBusy(false);
+    }
+  }
+
+  return (
+    <Layout wide>
+      <section className="qr-hero" style={{ backgroundImage: "linear-gradient(90deg, rgba(239,226,207,.96) 0%, rgba(239,226,207,.87) 39%, rgba(239,226,207,.05) 77%), url('/images/qr-camera.png')" }}>
+        <div className="qr-hero-copy">
+          <p className="eyebrow"><span className="eyebrow-line" /> QR SCAN / 02</p>
+          <h1>Pause. Scan.<br /><em>Proceed.</em></h1>
+          <p>Read the code. Check the destination. Choose with confidence.</p>
+          <div className="qr-hero-actions">
+            <button className="button button-dark" onClick={() => { setCameraError(''); setCameraOpen(v => !v); }}><Camera size={17} />{cameraOpen ? 'CLOSE CAMERA' : 'OPEN CAMERA'} <ArrowRight size={16} /></button>
+            <label className="button button-light upload-button"><Upload size={17} /> UPLOAD QR IMAGE<input type="file" accept="image/*" onChange={e => uploadFile(e.target.files?.[0])} disabled={fileBusy} /></label>
+          </div>
+          <p className="scan-note"><LockKeyhole size={14} /> Decoded links are analyzed, never opened.</p>
+        </div>
+        <div className="image-label image-label-light">SENTINEL / QR INTELLIGENCE</div>
+      </section>
+
+      <section className="qr-workspace">
+        <div className="qr-instructions">
+          <p className="eyebrow">HOW IT WORKS</p>
+          <h2>One scan before<br /><em>you trust it.</em></h2>
+          <ol>
+            <li><span>01</span> Read the QR code with your camera or upload an image.</li>
+            <li><span>02</span> SENTINEL extracts the encoded URL.</li>
+            <li><span>03</span> The same ML model and real host check estimate its phishing risk.</li>
+          </ol>
+        </div>
+        <div className="qr-camera-panel">
+          <div id="sentinel-qr-reader" className={cameraOpen ? 'qr-reader' : 'qr-reader-hidden'} />
+          {!cameraOpen && (
+            <div className="camera-placeholder">
+              <div className="camera-frame"><ScanLine size={40} /></div>
+              <strong>Ready when you are</strong>
+              <span>Open the camera or upload a QR image to begin.</span>
+            </div>
+          )}
+          {(cameraError || fileBusy) && <p className={cameraError ? 'qr-error' : 'scan-note'} role="status">{fileBusy ? 'Reading QR image…' : cameraError}</p>}
+          {qrValue && !scan.result && <p className="decoded-url"><Check size={15} /> QR decoded: {qrValue}</p>}
+        </div>
+      </section>
+
+      <figure className="qr-reference-strip">
+        <img src="/images/qr-realworld.jpg" alt="A person scanning a printed QR code with a smartphone on a warm wooden table" />
+        <figcaption><span>SCAN WITH INTENTION</span><span>Always check the destination before opening it.</span></figcaption>
+      </figure>
+
+      {scan.error && <div className="notice error" role="alert">{scan.error}</div>}
+      {scan.loading && <div className="loading-panel"><LoaderCircle className="spin" /> Analyzing the decoded URL with the trained model and real-time checks…</div>}
+      <ResultCard result={scan.result} onReset={() => { scan.reset(); setQrValue(''); }} />
+    </Layout>
+  );
+}
+
+function HistoryPage() {
+  const [scans, setScans] = useState([]);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setError('');
+      const r = await fetch(`${API}/api/scans?limit=100`, { headers: userHeaders() });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || 'Could not load scan history.');
+      setScans(d.scans || []);
+    } catch (e) {
+      setError(e.message || 'Backend unavailable.');
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function clear() {
+    if (!window.confirm('Clear all saved SENTINEL scan history?')) return;
+    setBusy(true);
+    try {
+      const r = await fetch(`${API}/api/scans`, { method: 'DELETE', headers: userHeaders() });
+      if (!r.ok) throw new Error();
+      setScans([]);
+    } catch {
+      setError('Could not clear scan history.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const countHigh = scans.filter(s => s.riskLevel === 'HIGH').length;
+  const countLow = scans.filter(s => s.riskLevel === 'LOW').length;
+
+  return (
+    <Layout>
+      <section className="page-heading">
+        <p className="eyebrow">YOUR ACTIVITY / ARCHIVE</p>
+        <h1>A record of<br /><em>every check.</em></h1>
+        <p>Past URL and QR scans saved privately for this browser.</p>
+      </section>
+
+      {error && <div className="notice error">{error}</div>}
+
+      <div className="history-stats">
+        <div><span>TOTAL SCANS</span><strong>{scans.length}</strong></div>
+        <div><span>LOWER RISK</span><strong>{countLow}</strong></div>
+        <div><span>HIGH RISK</span><strong>{countHigh}</strong></div>
+      </div>
+
+      <div className="history-toolbar">
+        <p>{scans.length} saved {scans.length === 1 ? 'assessment' : 'assessments'}</p>
+        <div>
+          <button className="button button-light" onClick={load}><Clock3 size={15} /> REFRESH</button>
+          <button className="button button-light" onClick={clear} disabled={busy}><Trash2 size={15} /> CLEAR HISTORY</button>
+        </div>
+      </div>
+
+      {!scans.length ? (
+        <div className="empty-state">
+          <History size={28} />
+          <h3>Your archive is quiet.</h3>
+          <p>Once you scan a URL or QR code, the assessment will appear here.</p>
+          <Link className="text-link" to="/scan-url">Start your first scan <ArrowRight size={15} /></Link>
+        </div>
+      ) : (
+        <div className="history-list">
+          {scans.map(s => (
+            <article className="history-row" key={s.id}>
+              <div className="history-row-icon"><Link2 size={19} /></div>
+              <div className="history-row-main">
+                <strong>{s.hostname}</strong>
+                <small>{s.url}</small>
+                <span>{s.createdAt ? new Date(`${s.createdAt.replace(' ', 'T')}Z`).toLocaleString() : 'Date unavailable'}</span>
+              </div>
+              <span className={`risk-pill ${riskClass(s.riskLevel)}`}>{s.riskLevel}</span>
+              <strong className="history-score">{s.riskScore}%</strong>
+            </article>
+          ))}
+        </div>
+      )}
+    </Layout>
+  );
+}
+
+function ModelPage() {
+  const [info, setInfo] = useState(null);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    fetch(`${API}/api/model-info`)
+      .then(async r => {
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.message || 'Model metrics unavailable.');
+        setInfo(d);
+      })
+      .catch(e => setError(e.message));
+  }, []);
+
+  const pct = v => typeof v === 'number' ? `${(v * 100).toFixed(1)}%` : '—';
+
+  return (
+    <Layout>
+      <section className="page-heading">
+        <p className="eyebrow">MODEL NOTES / TRANSPARENCY</p>
+        <h1>Intelligence,<br /><em>made explainable.</em></h1>
+        <p>SENTINEL extracts lexical characteristics from the URL and uses a trained Random Forest classifier to estimate phishing risk.</p>
+      </section>
+
+      {error && <div className="notice">{error} The deployment build trains the model from the public UCI dataset.</div>}
+
+      {info && (
+        <>
+          <div className="model-summary">
+            <span className="model-badge"><Sparkles size={17} /> TRAINED MODEL</span>
+            <h2>{info.model}</h2>
+            <p>{info.dataset}</p>
+            <a href={info.datasetSource} target="_blank" rel="noreferrer">Dataset source: UCI Machine Learning Repository <ExternalLink size={14} /></a>
+          </div>
+
+          <div className="metric-grid">
+            {[['Accuracy', pct(info.accuracy)], ['Precision', pct(info.precision)], ['Recall', pct(info.recall)], ['F1 score', pct(info.f1)], ['ROC AUC', pct(info.rocAuc)], ['URL features', info.featureCount]].map(([label, value]) => (
+              <div className="metric-card" key={label}><span>{label}</span><strong>{value}</strong></div>
+            ))}
+          </div>
+
+          <p className="model-footnote">
+            Evaluation is measured on a held-out split from the downloaded dataset. These scores do not guarantee real-world detection performance; URL-only models can miss new or carefully disguised attacks. {info.rowsUsed?.toLocaleString()} rows used; {info.trainRows?.toLocaleString()} for training and {info.testRows?.toLocaleString()} for testing.
+          </p>
+
+          <div className="confusion-card">
+            <h3>Confusion matrix</h3>
+            <p>Rows are actual classes; columns are predicted classes. Class 1 means phishing.</p>
+            <div className="matrix-grid">
+              <span />
+              <strong>Predicted legitimate</strong>
+              <strong>Predicted phishing</strong>
+              <strong>Actual legitimate</strong>
+              <span>{info.confusionMatrix?.[0]?.[0] ?? '—'}</span>
+              <span>{info.confusionMatrix?.[0]?.[1] ?? '—'}</span>
+              <strong>Actual phishing</strong>
+              <span>{info.confusionMatrix?.[1]?.[0] ?? '—'}</span>
+              <span>{info.confusionMatrix?.[1]?.[1] ?? '—'}</span>
+            </div>
+          </div>
+        </>
+      )}
+    </Layout>
+  );
+}
+
+function NotFound() {
+  return (
+    <Layout>
+      <section className="page-heading">
+        <p className="eyebrow">404 / NOT FOUND</p>
+        <h1>This page<br /><em>isn't here.</em></h1>
+        <Link className="button button-dark" to="/">Return home <ArrowRight size={16} /></Link>
+      </section>
+    </Layout>
+  );
+}
+
+export default function App() {
+  return (
+    <Routes>
+      <Route path="/" element={<Home />} />
+      <Route path="/scan-url" element={<UrlScanPage />} />
+      <Route path="/scan-qr" element={<QrScanPage />} />
+      <Route path="/history" element={<HistoryPage />} />
+      <Route path="/model" element={<ModelPage />} />
+      <Route path="*" element={<NotFound />} />
+    </Routes>
+  );
+}
+
+
+===== FILE: frontend/src/components/ScanForm.jsx =====
+import { useEffect, useRef, useState } from 'react';
+import { ScanSearch, ArrowRight, Camera, CameraOff } from 'lucide-react';
+import { Html5Qrcode } from 'html5-qrcode';
+
+export default function ScanForm({ onScan, loading = false }) {
+  const [url, setUrl] = useState('');
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const [cameraError, setCameraError] = useState('');
+  const scannerRef = useRef(null);
+  const processingRef = useRef(false);
+  const onScanRef = useRef(onScan);
+
+  useEffect(() => {
+    onScanRef.current = onScan;
+  }, [onScan]);
+
+  useEffect(() => {
+    if (!cameraOpen) return undefined;
+    let cancelled = false;
+    let scanner;
+
+    async function start() {
+      try {
+        scanner = new Html5Qrcode('qr-reader');
+        scannerRef.current = scanner;
+        await scanner.start(
+          { facingMode: 'environment' },
+          { fps: 10, qrbox: { width: 220, height: 220 }, aspectRatio: 1 },
+          async (decodedText) => {
+            if (cancelled || processingRef.current) return;
+            let parsed;
+            try {
+              parsed = new URL(decodedText.trim());
+            } catch {
+              setCameraError('This QR code does not contain a valid website URL.');
+              return;
+            }
+            if (!['http:', 'https:'].includes(parsed.protocol)) {
+              setCameraError('Please scan a QR code containing an HTTP or HTTPS URL.');
+              return;
+            }
+            processingRef.current = true;
+            setUrl(parsed.href);
+            setCameraError('');
+            setCameraOpen(false);
+            onScanRef.current?.(parsed.href);
+            processingRef.current = false;
+          },
+          () => {}
+        );
+      } catch {
+        if (!cancelled) {
+          setCameraError('Could not open the camera. Allow camera permission and try again.');
+          setCameraOpen(false);
+        }
+      }
+    }
+
+    start();
+    return () => {
+      cancelled = true;
+      if (scannerRef.current === scanner) scannerRef.current = null;
+      if (scanner) {
+        (async () => {
+          try { if (scanner.isScanning) await scanner.stop(); } catch {}
+          try { scanner.clear(); } catch {}
+        })();
+      }
+    };
+  }, [cameraOpen]);
+
+  function submit(event) {
+    event.preventDefault();
+    setCameraError('');
+    let parsed;
+    try {
+      parsed = new URL(url.trim());
+    } catch {
+      setCameraError('Enter a valid URL, such as https://example.com.');
+      return;
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      setCameraError('Only HTTP and HTTPS website URLs are supported.');
+      return;
+    }
+    onScanRef.current?.(parsed.href);
+  }
+
+  return (
+    <section id="scanner" className="scanner-panel">
+      <div className="scan-columns">
+        <div className="qr-side">
+          <div className="scanner-title"><span className="scanner-icon"><Camera size={21} /></span><h3>Scan a QR code</h3></div>
+          <p>Use your camera to read a QR code containing a website URL.</p>
+          {cameraOpen && <div className="qr-reader-container"><div id="qr-reader" /></div>}
+          {cameraError && <p className="qr-error" role="alert">{cameraError}</p>}
+          <button type="button" className="secondary-button" disabled={loading} onClick={() => { setCameraError(''); setCameraOpen((open) => !open); }}>
+            {cameraOpen ? <CameraOff size={17} /> : <Camera size={17} />}
+            {cameraOpen ? 'Stop camera' : 'Open QR camera'}
+          </button>
+        </div>
+        <div className="url-side">
+          <div className="scanner-title"><span className="scanner-icon"><ScanSearch size={21} /></span><h3>Analyze a URL</h3></div>
+          <p>Paste a full URL to check for common phishing signals.</p>
+          <form onSubmit={submit}>
+            <label className="url-label" htmlFor="url-input">Website URL</label>
+            <div className="url-input-row">
+              <input id="url-input" type="url" value={url} onChange={(e) => { setUrl(e.target.value); setCameraError(''); }} placeholder="https://example.com/login" required disabled={loading} />
+              <button className="primary-button" type="submit" disabled={loading || !url.trim()}>
+                {loading ? 'Analyzing…' : <>Analyze <ArrowRight size={17} /></>}
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+      <div className="scanner-footnote"><span>✓ URL checks only</span><span>✓ Does not open the scanned page</span><span>✓ Scan history saved to SQLite</span></div>
+    </section>
+  );
+}
+
+
+===== FILE: frontend/src/styles.css =====
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Playfair+Display:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap');
+:root{font-family:'DM Sans',sans-serif;color:#29231d;background:#f1e8da;font-synthesis:none;text-rendering:optimizeLegibility;--ink:#29231d;--muted:#75695c;--cream:#f7f0e5;--paper:#fbf7ef;--beige:#e8dac6;--line:#d5c5af;--brown:#5b4735;--dark:#28211b;--accent:#9b8061;--danger:#985348;--green:#596b51;--amber:#927044}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;min-width:320px;background:linear-gradient(135deg,#f6efe4 0%,#eee2d0 55%,#e9ddca 100%)}button,input{font:inherit}button,a,label{-webkit-tap-highlight-color:transparent}button{cursor:pointer}a{color:inherit;text-decoration:none}.app{min-height:100vh}.site-header{max-width:1500px;margin:auto;padding:26px 5.2%;display:flex;align-items:center;justify-content:space-between;gap:24px}.wordmark{display:flex;align-items:center;gap:13px;white-space:nowrap}.wordmark span{font:500 19px 'Playfair Display',Georgia,serif;letter-spacing:.23em}.wordmark i{height:25px;width:1px;background:#8f7c66;display:block}.wordmark small{font-size:10px;letter-spacing:.22em;color:#685b4c}.site-header nav{display:flex;align-items:center;gap:clamp(18px,3vw,42px)}.site-header nav a{font-size:12px;letter-spacing:.045em;color:#796c5d;transition:color .2s}.site-header nav a:hover,.site-header nav a.active{color:#241d17}.site-header nav a.active{border-bottom:1px solid #8b7257;padding-bottom:6px}.page-main{width:min(1100px,90%);margin:0 auto;padding:30px 0 90px}.page-main-wide{width:min(1450px,92%)}.home-hero{min-height:600px;position:relative;background-size:cover;background-position:center 57%;border-radius:4px;overflow:hidden;display:flex;align-items:center;padding:clamp(32px,6vw,88px);box-shadow:0 25px 70px #6e573b12}.home-copy{width:min(600px,62%);position:relative;z-index:1}.eyebrow{font-size:10px;font-weight:600;letter-spacing:.19em;color:#89745c;margin:0 0 24px;display:flex;align-items:center;gap:12px}.eyebrow-line{width:35px;height:1px;background:#a48b6d;display:inline-block}.home-copy h1,.scan-hero h1,.qr-hero h1,.page-heading h1{font:400 clamp(46px,6.2vw,82px)/1.03 'Playfair Display',Georgia,serif;letter-spacing:-.045em;margin:0;color:#29221b}.home-copy h1 em,.home-intro h2 em,.scan-hero h1 em,.qr-hero h1 em,.page-heading h1 em,.qr-instructions h2 em{font-weight:400;color:#80664b}.home-subtitle{font-size:17px;letter-spacing:.01em;margin:24px 0 12px;color:#514334}.home-description{max-width:440px;font-size:13px;line-height:1.9;color:#695b4b;margin:0}.home-actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:30px}.button{min-height:48px;padding:0 19px;display:inline-flex;align-items:center;justify-content:center;gap:11px;border:1px solid transparent;border-radius:3px;font-size:10px;font-weight:600;letter-spacing:.1em;transition:transform .2s,background .2s,border-color .2s}.button:hover{transform:translateY(-2px)}.button-dark{background:#33281e;color:#fbf3e8;border-color:#33281e}.button-dark:hover{background:#4a3829}.button-light{background:rgba(249,242,231,.84);color:#33281e;border-color:#b9a58b}.button-light:hover{background:#fffaf1}.formal-title{font-size:9px;letter-spacing:.16em;color:#6e5b46;margin-top:35px}.home-photo-caption{position:absolute;bottom:24px;left:clamp(32px,6vw,88px);right:clamp(32px,6vw,88px);display:flex;justify-content:space-between;gap:15px;font-size:9px;letter-spacing:.15em;color:#77654e}.home-intro{padding:90px 5% 62px;display:grid;grid-template-columns:1fr 1fr;gap:10%;align-items:center}.home-intro h2,.qr-instructions h2{font:400 clamp(34px,4vw,53px)/1.13 'Playfair Display',Georgia,serif;letter-spacing:-.035em;margin:0}.home-intro>p{max-width:470px;font-size:13px;line-height:2;color:#706354}.choice-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;padding:0 5% 60px}.choice-card{border:1px solid #d5c5af;background:rgba(251,247,239,.7);padding:30px 32px;min-height:265px;display:flex;flex-direction:column;align-items:flex-start;transition:transform .25s,box-shadow .25s}.choice-card:hover{transform:translateY(-4px);box-shadow:0 20px 45px #58432a0c}.choice-index{font-size:9px;letter-spacing:.17em;color:#958069}.choice-icon{margin-top:22px;width:42px;height:42px;display:grid;place-items:center;background:#eee2d0;color:#72583f;border-radius:50%}.choice-card h3{font:400 25px 'Playfair Display',Georgia,serif;margin:16px 0 7px}.choice-card p{font-size:12px;line-height:1.8;color:#796c5d;max-width:390px;margin:0 0 22px}.choice-link{display:flex;align-items:center;gap:9px;margin-top:auto;font-size:9px;letter-spacing:.13em;color:#6d5238}.promise-strip{display:flex;justify-content:center;gap:clamp(18px,4vw,52px);flex-wrap:wrap;padding:25px 0;border-top:1px solid #d8c9b5;border-bottom:1px solid #d8c9b5;color:#776855;font-size:11px}.promise-strip span{display:flex;align-items:center;gap:9px}.promise-strip svg{color:#8b7356}.site-footer{width:min(1450px,92%);margin:0 auto;padding:25px 0 35px;border-top:1px solid #d8c9b5;display:flex;justify-content:space-between;gap:18px;flex-wrap:wrap;font-size:9px;letter-spacing:.08em;color:#8a7a67}.site-footer i{font-style:normal;padding:0 4px}.scan-hero,.qr-hero{min-height:530px;position:relative;background-size:cover;background-position:center;border-radius:4px;display:flex;align-items:center;padding:clamp(30px,5vw,70px);overflow:hidden;box-shadow:0 25px 70px #3e2b1b13}.url-hero{background-position:center 54%}.scan-hero-copy{width:min(650px,75%);position:relative;z-index:1;color:#f8f0e4}.eyebrow-light{color:#d8c3a7}.eyebrow-light .eyebrow-line{background:#d1b797}.scan-hero h1{color:#f7eee2;font-size:clamp(46px,6vw,78px)}.scan-hero h1 em{color:#d9c2a2}.scan-hero-copy>p:not(.eyebrow):not(.scan-note){font-size:14px;color:#d8c9b5;margin:24px 0 28px}.url-form{display:flex;align-items:center;gap:12px;width:min(650px,100%);padding:7px 7px 7px 15px;border:1px solid #ad9678;background:#251e18bd;border-radius:4px}.url-form>svg{color:#cfb797;flex-shrink:0}.url-form input{min-width:0;flex:1;border:0;outline:0;background:transparent;color:#fff5e7;font-size:13px;padding:10px 0}.url-form input::placeholder{color:#c3b09a}.url-form button{border:0;background:#e8d6bd;color:#32271d;display:flex;align-items:center;gap:12px;min-height:44px;padding:0 16px;border-radius:2px;font-size:10px;letter-spacing:.1em;font-weight:700}.url-form button:disabled{opacity:.7}.scan-note{display:flex;align-items:center;gap:8px;font-size:11px;color:#d0bea5;margin-top:17px}.image-label{position:absolute;right:26px;bottom:24px;color:#e2d0b7;font-size:8px;letter-spacing:.19em}.scan-bottom{display:flex;justify-content:space-between;gap:15px;padding:24px 6px;color:#89745c;font-size:9px;letter-spacing:.15em}.qr-hero{background-position:center 55%;min-height:530px}.qr-hero-copy{width:min(590px,70%);position:relative;z-index:1}.qr-hero h1{font-size:clamp(46px,6vw,76px)}.qr-hero-copy>p:not(.eyebrow):not(.scan-note){max-width:380px;color:#6f5e4b;line-height:1.8;font-size:14px;margin:23px 0}.qr-hero-actions{display:flex;gap:10px;flex-wrap:wrap}.upload-button{position:relative;overflow:hidden;cursor:pointer}.upload-button input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}.image-label-light{color:#79654d}.qr-workspace{display:grid;grid-template-columns:.8fr 1.2fr;gap:8%;padding:70px 5% 50px;align-items:center}.qr-instructions h2{margin-bottom:26px}.qr-instructions ol{list-style:none;padding:0;margin:0;display:grid;gap:18px}.qr-instructions li{font-size:12px;line-height:1.8;color:#6f6252;display:grid;grid-template-columns:38px 1fr;gap:10px}.qr-instructions li span{font-size:10px;letter-spacing:.1em;color:#9c8060}.qr-camera-panel{min-height:310px;border:1px solid #d5c5af;background:#f9f3e9d9;padding:22px;display:flex;flex-direction:column;justify-content:center;align-items:center}.camera-placeholder{min-height:260px;width:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:12px;color:#6f5e4b}.camera-frame{width:100px;height:100px;border:1px solid #c5b296;display:grid;place-items:center;color:#7e654a;outline:1px dashed #c5b296;outline-offset:8px;margin-bottom:8px}.camera-placeholder strong{font:400 22px 'Playfair Display',Georgia,serif}.camera-placeholder>span{font-size:11px;max-width:280px;line-height:1.7;color:#8a7b68}.qr-reader{width:100%;max-width:520px}.qr-reader video{object-fit:cover!important}.qr-reader-hidden{display:none!important}.qr-error{font-size:12px;color:#974e43;background:#f8e8e1;padding:12px 14px;width:100%;line-height:1.5}.decoded-url{font-size:11px;color:#5c6a4d;word-break:break-all;display:flex;align-items:flex-start;gap:6px}.result-card{background:#fbf7ef;border:1px solid #d5c5af;padding:clamp(22px,4vw,42px);margin-top:28px;box-shadow:0 20px 55px #634a2c0b}.result-top{display:flex;justify-content:space-between;gap:24px;align-items:center}.result-top h2{font:400 clamp(26px,3vw,38px)/1.1 'Playfair Display',Georgia,serif;margin:0}.result-top .eyebrow{margin-bottom:13px}.result-host{font-size:13px;color:#70604f;word-break:break-all;margin:12px 0 5px}.result-verdict{font-size:12px;color:#8a7a67;margin:0}.score-ring{width:116px;height:116px;flex-shrink:0;border-radius:50%;border:1px solid #d2c2ad;background:#f3e9d9;display:flex;flex-direction:column;align-items:center;justify-content:center}.score-ring strong{font:400 28px 'Playfair Display',Georgia,serif}.score-ring span{font-size:7px;letter-spacing:.12em;margin-top:4px}.score-ring.low{color:#52674a;border-color:#a8b59d}.score-ring.moderate{color:#8a693e;border-color:#c7b08c}.score-ring.high{color:#985348;border-color:#d3a69d}.score-track{height:6px;background:#e8ddcc;margin:25px 0 20px;overflow:hidden;border-radius:8px}.score-track span{height:100%;display:block;background:#9a8266;transition:width .4s}.score-track span.low{background:#708267}.score-track span.moderate{background:#b2915c}.score-track span.high{background:#a95f51}.result-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.result-stats>div{padding:16px;background:#f4ecdf;border:1px solid #e3d6c4;display:flex;flex-direction:column;gap:7px}.result-stats span{font-size:8px;letter-spacing:.15em;color:#8b7b67}.result-stats strong{font-size:15px;font-weight:600}.risk-text.low{color:#52674a}.risk-text.moderate{color:#8a693e}.risk-text.high{color:#985348}.signals-heading{display:flex;justify-content:space-between;gap:20px;align-items:end;margin-top:32px}.signals-heading .eyebrow{margin-bottom:9px}.signals-heading h3,.confusion-card h3{font:400 24px 'Playfair Display',Georgia,serif;margin:0}.muted-small{font-size:10px;color:#958571}.reason-list{padding:0;list-style:none;display:grid;gap:9px;margin:18px 0 0}.reason-list li{display:flex;align-items:flex-start;gap:11px;padding:13px 15px;background:#f4ecdf;font-size:12px;line-height:1.7;color:#625444}.reason-list li span{color:#927650;display:flex;margin-top:2px}.recommendation{display:flex;align-items:flex-start;gap:14px;background:#34291f;color:#f8f0e4;padding:20px;margin-top:20px}.recommendation>svg{flex-shrink:0;color:#d8c1a0}.recommendation strong{font-size:12px}.recommendation p{font-size:12px;line-height:1.8;color:#d8c9b7;margin:6px 0 0}.result-disclaimer,.model-footnote{font-size:10px;line-height:1.8;color:#91816c}.reset-button{margin-top:10px}.notice{padding:15px 17px;background:#f4ead8;border:1px solid #d7c4a9;color:#65513b;font-size:12px;line-height:1.6;margin-top:20px}.notice.error{background:#f7e8e1;border-color:#d9b6ab;color:#8c4b40}.loading-panel{display:flex;align-items:center;justify-content:center;gap:12px;padding:30px;background:#f9f3e9;border:1px solid #d5c5af;margin-top:20px;font-size:12px;color:#75634e}.spin{animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.page-heading{padding:55px 0 40px;border-bottom:1px solid #d8c9b5}.page-heading h1{font-size:clamp(44px,6vw,70px)}.page-heading>p:not(.eyebrow){max-width:580px;color:#766858;font-size:13px;line-height:1.9;margin-top:22px}.history-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:28px 0}.history-stats>div,.metric-card{background:#f9f3e9;border:1px solid #d7c7b2;padding:22px}.history-stats span,.metric-card span{display:block;color:#8c7a65;font-size:9px;letter-spacing:.16em}.history-stats strong,.metric-card strong{display:block;font:400 32px 'Playfair Display',Georgia,serif;margin-top:10px}.history-toolbar{display:flex;align-items:center;justify-content:space-between;gap:18px;margin:30px 0 16px}.history-toolbar p{font-size:12px;color:#766858}.history-toolbar>div{display:flex;gap:8px;flex-wrap:wrap}.history-toolbar .button{min-height:39px;padding:0 12px;font-size:9px}.history-list{border-top:1px solid #d5c5af}.history-row{display:flex;align-items:center;gap:18px;padding:19px 5px;border-bottom:1px solid #d5c5af}.history-row-icon{width:42px;height:42px;display:grid;place-items:center;background:#e8dac6;color:#80664b;flex-shrink:0}.history-row-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:5px}.history-row-main strong{font-size:13px}.history-row-main small{font-size:11px;color:#8b7a66;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.history-row-main span{font-size:9px;color:#9a8a77}.risk-pill{font-size:8px;letter-spacing:.12em;padding:7px 9px;border:1px solid #d1c1ab;white-space:nowrap}.risk-pill.low{color:#52674a;background:#edf0e8;border-color:#c4d0bb}.risk-pill.moderate{color:#88693e;background:#f5ecdc;border-color:#dfcba9}.risk-pill.high{color:#965146;background:#f6e9e4;border-color:#dfbbb2}.history-score{font-size:13px;min-width:44px;text-align:right}.empty-state{padding:60px 20px;text-align:center;background:#f9f3e9;border:1px solid #d5c5af;color:#8d7a64}.empty-state h3{font:400 25px 'Playfair Display',Georgia,serif;color:#352a20;margin:15px 0 7px}.empty-state p{font-size:12px;line-height:1.8}.text-link{display:inline-flex;align-items:center;gap:8px;font-size:11px;color:#6d5238;margin-top:15px}.model-summary{padding:28px 0 20px}.model-badge{display:inline-flex;align-items:center;gap:7px;background:#e7dac7;color:#72583f;padding:8px 11px;font-size:9px;letter-spacing:.12em}.model-summary h2{font:400 32px 'Playfair Display',Georgia,serif;margin:20px 0 8px}.model-summary p{font-size:12px;color:#766858}.model-summary a{display:inline-flex;align-items:center;gap:8px;color:#76583b;font-size:11px;text-decoration:underline;text-underline-offset:3px}.metric-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.metric-card strong{font-size:29px}.confusion-card{margin-top:30px;padding:24px;background:#f9f3e9;border:1px solid #d5c5af}.confusion-card>p{font-size:11px;color:#887965;line-height:1.7}.matrix-grid{display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:1px;background:#d5c5af;border:1px solid #d5c5af;margin-top:20px}.matrix-grid>*{background:#f9f3e9;padding:13px 10px;font-size:11px;text-align:center}.matrix-grid strong{font-size:10px;color:#776652}.matrix-grid span{font:400 19px 'Playfair Display',Georgia,serif}.qr-hidden-reader{display:none!important}@media(max-width:850px){.site-header{padding:22px 4%;align-items:flex-start}.site-header nav{gap:15px;flex-wrap:wrap;justify-content:flex-end}.site-header nav a{font-size:10px}.wordmark span{font-size:16px}.wordmark small{font-size:8px}.page-main-wide{width:94%}.home-hero{min-height:570px;background-position:58% center}.home-copy{width:min(590px,78%)}.home-intro{padding:65px 2% 45px;gap:5%}.choice-grid{padding:0 2% 45px}.scan-hero,.qr-hero{min-height:500px}.qr-workspace{padding:55px 2% 40px;gap:5%}}@media(max-width:600px){.site-header{display:block;padding:20px 5%}.site-header nav{justify-content:space-between;margin-top:19px;gap:10px}.site-header nav a{font-size:10px}.page-main,.page-main-wide{width:92%;padding-top:16px;padding-bottom:55px}.home-hero{min-height:670px;align-items:flex-start;padding:40px 24px;background-position:64% center}.home-hero:before{content:"";position:absolute;inset:0;background:linear-gradient(180deg,rgba(239,226,207,.9) 0%,rgba(239,226,207,.78) 48%,rgba(239,226,207,.12) 100%)}.home-copy{width:100%}.home-copy h1{font-size:49px}.home-subtitle{font-size:15px}.home-description{font-size:12px;max-width:340px}.home-actions{gap:8px}.home-actions .button{padding:0 12px;font-size:9px;gap:7px}.home-photo-caption{left:24px;right:24px;bottom:17px;font-size:7px}.home-intro{grid-template-columns:1fr;padding:55px 2% 35px;gap:15px}.home-intro h2{font-size:39px}.choice-grid{grid-template-columns:1fr;padding:0 2% 35px}.choice-card{min-height:245px;padding:24px}.promise-strip{justify-content:flex-start;flex-direction:column;padding:20px 4%;gap:14px}.site-footer{width:92%;flex-direction:column;gap:10px}.scan-hero,.qr-hero{min-height:590px;padding:35px 23px;align-items:flex-start;background-position:62% center}.scan-hero:before,.qr-hero:before{content:"";position:absolute;inset:0;background:linear-gradient(180deg,rgba(29,22,16,.8) 0%,rgba(29,22,16,.65) 54%,rgba(29,22,16,.12) 100%)}.qr-hero:before{background:linear-gradient(180deg,rgba(239,226,207,.95) 0%,rgba(239,226,207,.85) 48%,rgba(239,226,207,.14) 100%)}.scan-hero-copy,.qr-hero-copy{width:100%}.scan-hero h1,.qr-hero h1{font-size:50px}.url-form{flex-wrap:wrap;padding:9px 10px}.url-form input{width:calc(100% - 45px);flex:auto}.url-form button{width:100%;justify-content:center}.image-label{right:15px;bottom:15px;font-size:7px}.qr-hero-actions{flex-direction:column;align-items:stretch}.qr-hero-actions .button{width:100%}.qr-workspace{grid-template-columns:1fr;padding:45px 2% 30px;gap:25px}.qr-camera-panel{padding:12px;min-height:270px}.result-top{align-items:flex-start;gap:10px}.result-top h2{font-size:26px}.score-ring{width:86px;height:86px}.score-ring strong{font-size:23px}.score-ring span{font-size:6px}.result-stats{grid-template-columns:1fr}.result-stats>div{padding:12px 14px;flex-direction:row;justify-content:space-between;align-items:center}.signals-heading{align-items:flex-start;flex-direction:column;gap:6px}.scan-bottom{flex-direction:column;gap:10px}.page-heading{padding:40px 0 28px}.page-heading h1{font-size:49px}.history-stats{gap:6px}.history-stats>div{padding:14px 10px}.history-stats span{font-size:7px}.history-stats strong{font-size:25px}.history-toolbar{align-items:flex-start;flex-direction:column}.history-row{gap:9px;flex-wrap:wrap}.history-row-icon{width:34px;height:34px}.history-row-main{flex-basis:calc(100% - 50px)}.history-row .risk-pill{margin-left:43px}.history-score{margin-left:auto}.metric-grid{grid-template-columns:repeat(2,1fr)}.metric-card{padding:15px}.metric-card strong{font-size:25px}.matrix-grid>*{padding:8px 4px;font-size:9px}.matrix-grid span{font-size:16px}.model-summary h2{font-size:27px}}@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important;transition:none!important}}
+.qr-reference-strip{margin:12px 5% 40px;display:grid;grid-template-columns:1.15fr 1fr;align-items:center;gap:24px;background:#f9f3e9;border:1px solid #d5c5af;padding:12px}.qr-reference-strip img{display:block;width:100%;max-height:280px;object-fit:cover}.qr-reference-strip figcaption{display:flex;flex-direction:column;gap:10px;padding:20px;color:#7a6852}.qr-reference-strip figcaption span:first-child{font-size:9px;letter-spacing:.17em}.qr-reference-strip figcaption span:last-child{font:400 22px/1.35 'Playfair Display',Georgia,serif;color:#34291f}@media(max-width:600px){.qr-reference-strip{grid-template-columns:1fr;margin:8px 2% 25px}.qr-reference-strip img{max-height:210px}.qr-reference-strip figcaption{padding:12px}}
+.qr-reference-strip{margin:12px 5% 40px;display:grid;grid-template-columns:1.15fr 1fr;align-items:center;gap:24px;background:#f9f3e9;border:1px solid #d5c5af;padding:12px}.qr-reference-strip img{display:block;width:100%;max-height:280px;object-fit:cover}.qr-reference-strip figcaption{display:flex;flex-direction:column;gap:10px;padding:20px;color:#7a6852}.qr-reference-strip figcaption span:first-child{font-size:9px;letter-spacing:.17em}.qr-reference-strip figcaption span:last-child{font:400 22px/1.35 'Playfair Display',Georgia,serif;color:#34291f}@media(max-width:600px){.qr-reference-strip{grid-template-columns:1fr;margin:8px 2% 25px}.qr-reference-strip img{max-height:210px}.qr-reference-strip figcaption{padding:12px}}
+
+/* Refined mobile homepage */
+@media (max-width: 600px) {
+  .site-header { padding: 18px 20px 10px; }
+  .wordmark { gap: 9px; }
+  .wordmark span { font-size: 16px; letter-spacing: .18em; }
+  .wordmark i { height: 20px; }
+  .wordmark small { font-size: 7px; letter-spacing: .16em; }
+  .site-header nav { margin-top: 14px; gap: 0; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); width: 100%; }
+  .site-header nav a { font-size: 8px; text-align: center; letter-spacing: .03em; padding-bottom: 5px; }
+  .page-main-wide { width: 100%; padding: 10px 14px 45px; }
+  .home-hero { min-height: 650px; padding: 34px 22px 62px; border-radius: 3px; background-position: 67% center; align-items: flex-start; }
+  .home-hero:before { background: linear-gradient(180deg, rgba(239,226,207,.97) 0%, rgba(239,226,207,.90) 46%, rgba(239,226,207,.28) 82%, rgba(239,226,207,.08) 100%); }
+  .home-copy { width: 100%; max-width: 360px; }
+  .home-copy .eyebrow { margin-bottom: 17px; font-size: 8px; letter-spacing: .14em; }
+  .home-copy h1 { font-size: 44px; line-height: .99; letter-spacing: -.035em; }
+  .home-subtitle { font-size: 14px; margin: 18px 0 10px; }
+  .home-description { font-size: 11px; line-height: 1.75; max-width: 300px; }
+  .home-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 24px; width: 100%; }
+  .home-actions .button { min-height: 47px; padding: 0 9px; font-size: 8px; letter-spacing: .08em; gap: 5px; white-space: nowrap; }
+  .home-actions .button svg { width: 15px; height: 15px; }
+  .formal-title { margin-top: 25px; font-size: 7px; line-height: 1.5; letter-spacing: .13em; max-width: 280px; }
+  .home-photo-caption { left: 22px; right: 22px; bottom: 16px; font-size: 6px; letter-spacing: .1em; }
+  .home-intro { padding: 48px 4% 34px; }
+  .home-intro h2 { font-size: 36px; }
+  .home-intro > p { font-size: 11px; line-height: 1.8; }
+  .choice-grid { padding: 0 2% 30px; gap: 10px; }
+  .choice-card { min-height: 220px; padding: 22px; }
+  .choice-card h3 { font-size: 23px; }
+  .promise-strip { font-size: 9px; }
+}
+
+
