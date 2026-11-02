@@ -76,3 +76,272 @@
     row-gap: 9px;
   }
 }
+
+/* ========================================================
+   CURSOR POP / HOVER MICRO-ANIMATIONS & INTERACTIVE STYLES
+   ======================================================== */
+
+/* Header Navigation Pop Effect */
+.site-header nav {
+  display: flex;
+  align-items: center;
+  gap: clamp(8px, 1.6vw, 20px);
+}
+
+.site-header nav a {
+  position: relative;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: .04em;
+  color: #6e5c4a;
+  padding: 8px 18px;
+  border-radius: 999px;
+  background: transparent;
+  border: 1px solid transparent;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.28s cubic-bezier(0.34, 1.56, 0.64, 1),
+              background 0.22s ease,
+              border-color 0.22s ease,
+              box-shadow 0.25s ease,
+              color 0.2s ease;
+  will-change: transform;
+}
+
+/* POP ON CURSOR HOVER */
+.site-header nav a:hover {
+  color: #241a12 !important;
+  background: rgba(255, 255, 255, 0.88);
+  border-color: #d6c4ae;
+  transform: translateY(-3px) scale(1.08); /* Pop up! */
+  box-shadow: 0 8px 20px rgba(78, 59, 41, 0.14);
+}
+
+.site-header nav a:active {
+  transform: translateY(0) scale(0.96);
+}
+
+/* Active navigation item pill */
+.site-header nav a.active {
+  color: #241a12 !important;
+  font-weight: 600;
+  background: #ebdcc8;
+  border-color: #cbbaa0;
+  border-bottom: 1px solid #cbbaa0;
+  padding-bottom: 8px;
+  box-shadow: 0 4px 12px rgba(78, 59, 41, 0.08);
+  transform: scale(1.02);
+}
+
+.site-header nav a.active:hover {
+  transform: translateY(-2px) scale(1.07);
+  background: #f1e4d3;
+  box-shadow: 0 8px 22px rgba(78, 59, 41, 0.16);
+}
+
+/* Button Cursor Pop Effect */
+.button {
+  min-height: 48px;
+  padding: 0 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 11px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .12em;
+  transition: transform 0.26s cubic-bezier(0.34, 1.56, 0.64, 1),
+              box-shadow 0.26s ease,
+              background 0.2s ease,
+              border-color 0.2s ease;
+  will-change: transform;
+}
+
+.button:hover {
+  transform: translateY(-3px) scale(1.03); /* Pop effect */
+  box-shadow: 0 12px 28px rgba(45, 34, 24, 0.22);
+}
+
+.button:active {
+  transform: translateY(-1px) scale(0.98);
+}
+
+.button-dark:hover {
+  background: #473628;
+  border-color: #473628;
+  box-shadow: 0 14px 30px rgba(35, 26, 18, 0.32);
+}
+
+.button-light:hover {
+  background: #ffffff;
+  border-color: #9d8466;
+  box-shadow: 0 12px 26px rgba(91, 71, 53, 0.16);
+}
+
+/* Wordmark Logo Hover Pop */
+.wordmark {
+  transition: transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
+  will-change: transform;
+}
+.wordmark:hover {
+  transform: scale(1.03);
+}
+
+/* Form Buttons Pop */
+.url-form button {
+  transition: transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1),
+              box-shadow 0.25s ease,
+              background 0.2s ease;
+  will-change: transform;
+}
+
+.url-form button:hover:not(:disabled) {
+  transform: translateY(-2px) scale(1.05);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.3);
+  background: #f7e6ce;
+}
+
+/* Choice Cards Pop Effect */
+.choice-card {
+  transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1),
+              box-shadow 0.3s ease,
+              border-color 0.2s ease;
+  will-change: transform;
+}
+
+.choice-card:hover {
+  transform: translateY(-6px) scale(1.018);
+  box-shadow: 0 24px 50px rgba(88, 67, 42, 0.15);
+  border-color: #baa78e;
+}
+
+/* Reset button Pop */
+.reset-button {
+  transition: transform 0.26s cubic-bezier(0.34, 1.56, 0.64, 1),
+              box-shadow 0.26s ease,
+              background 0.2s ease;
+}
+
+.reset-button:hover {
+  transform: translateY(-3px) scale(1.03);
+  box-shadow: 0 12px 26px rgba(45, 34, 24, 0.25);
+}
+
+/* ========================================================
+   QR SCAN RESULT CARD & BADGE ENHANCEMENTS
+   ======================================================== */
+
+.qr-hero {
+  background-position: right 52% center;
+  background-size: cover;
+  background-repeat: no-repeat;
+}
+
+.qr-result-section {
+  width: 100%;
+  margin-top: 24px;
+  scroll-margin-top: 40px;
+}
+
+.decoded-qr-badge {
+  margin-top: 16px;
+  width: 100%;
+  max-width: 520px;
+  background: #f2ebd9;
+  border: 1px solid #c9b499;
+  border-left: 4px solid #58704c;
+  padding: 14px 18px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  border-radius: 3px;
+  animation: fadeInPop 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.decoded-qr-badge svg {
+  color: #4b663f;
+  flex-shrink: 0;
+}
+
+.decoded-qr-badge small {
+  display: block;
+  font-size: 8px;
+  letter-spacing: .15em;
+  color: #84725e;
+  margin-bottom: 3px;
+}
+
+.decoded-qr-badge strong {
+  font-size: 13px;
+  color: #271f18;
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.qr-busy-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  background: #f3ebd9;
+  border: 1px solid #cbb89e;
+  padding: 10px 16px;
+  border-radius: 999px;
+  color: #6d5945;
+  font-size: 12px;
+  font-weight: 500;
+  margin-top: 14px;
+}
+
+.result-url-raw {
+  margin: 6px 0 10px;
+  color: #7b6a57;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  word-break: break-all;
+}
+
+@keyframes fadeInPop {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+
+
+/* Uploaded Image Preview */
+.uploaded-preview-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  background: #fffdf9;
+  border: 1px dashed #cbb8a0;
+  border-radius: 4px;
+  max-width: 240px;
+  margin-bottom: 8px;
+}
+
+.uploaded-preview-img {
+  max-width: 180px;
+  max-height: 180px;
+  object-fit: contain;
+  border-radius: 2px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+.uploaded-preview-box span {
+  font-size: 9px;
+  letter-spacing: .12em;
+  color: #8c7965;
+  text-transform: uppercase;
+}
+

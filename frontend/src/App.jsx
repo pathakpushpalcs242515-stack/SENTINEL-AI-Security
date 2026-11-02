@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, NavLink, Route, Routes } from 'react-router-dom';
-import { ArrowRight, Camera, Check, CircleAlert, Clock3, ExternalLink, History, Link2, LoaderCircle, LockKeyhole, ScanLine, ShieldCheck, Sparkles, Trash2, Upload } from 'lucide-react';
+import { ArrowRight, Camera, Check, CircleAlert, Clock3, ExternalLink, History, Link2, LoaderCircle, LockKeyhole, ScanLine, ShieldCheck, Sparkles, Trash2, Upload, QrCode } from 'lucide-react';
 import { Html5Qrcode } from 'html5-qrcode';
+import jsQR from 'jsqr';
 
 const API = (import.meta.env.VITE_API_URL || 'http://localhost:5000').replace(/\/$/, '');
 const USER_KEY = 'sentinel-browser-user-id';
@@ -247,13 +248,152 @@ function UrlScanPage() {
   );
 }
 
+// Bulletproof multi-engine QR decoder using Native BarcodeDetector + multi-pass jsQR
+async function decodeQrFromImage(file) {
+  if (!file) throw new Error('No image file selected.');
+
+  const img = await new Promise((resolve, reject) => {
+    const objectUrl = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error('Could not open the selected image file.'));
+    };
+    image.src = objectUrl;
+  });
+
+  // Strategy 1: Native BarcodeDetector (Supported in modern Chrome/Edge/Chromium)
+  if (typeof window !== 'undefined' && 'BarcodeDetector' in window) {
+    try {
+      const barcodeDetector = new window.BarcodeDetector({ formats: ['qr_code'] });
+      const barcodes = await barcodeDetector.detect(img);
+      if (barcodes && barcodes.length > 0 && barcodes[0].rawValue) {
+        return barcodes[0].rawValue;
+      }
+    } catch {}
+  }
+
+  // Strategy 2: jsQR with multiple scales and contrast binarization passes
+  function scanCanvas(w, h, binarize = false) {
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx) return null;
+      ctx.drawImage(img, 0, 0, w, h);
+      const imageData = ctx.getImageData(0, 0, w, h);
+      const data = imageData.data;
+
+      if (binarize) {
+        let total = 0;
+        const totalPixels = w * h;
+        for (let i = 0; i < data.length; i += 4) {
+          total += (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114);
+        }
+        const threshold = (total / totalPixels) * 0.93;
+        for (let i = 0; i < data.length; i += 4) {
+          const gray = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+          const val = gray >= threshold ? 255 : 0;
+          data[i] = val;
+          data[i + 1] = val;
+          data[i + 2] = val;
+        }
+      }
+
+      const code = jsQR(data, w, h, { inversionAttempts: 'attemptBoth' });
+      return code?.data || null;
+    } catch {
+      return null;
+    }
+  }
+
+  const origW = img.naturalWidth || img.width;
+  const origH = img.naturalHeight || img.height;
+  const maxDim = Math.max(origW, origH);
+
+  // Pass 1: Original size
+  let found = scanCanvas(origW, origH, false);
+  if (found) return found;
+
+  // Pass 2: High-contrast binarized (handles glare / shadows / camera noise)
+  found = scanCanvas(origW, origH, true);
+  if (found) return found;
+
+  // Pass 3: 1000px downscaled (fixes phone cameras > 12MP)
+  if (maxDim > 1000) {
+    const ratio = 1000 / maxDim;
+    const w = Math.round(origW * ratio);
+    const h = Math.round(origH * ratio);
+    found = scanCanvas(w, h, false);
+    if (found) return found;
+    found = scanCanvas(w, h, true);
+    if (found) return found;
+  }
+
+  // Pass 4: 650px scale (handles dense / smaller QR codes)
+  if (maxDim > 650) {
+    const ratio = 650 / maxDim;
+    const w = Math.round(origW * ratio);
+    const h = Math.round(origH * ratio);
+    found = scanCanvas(w, h, false);
+    if (found) return found;
+    found = scanCanvas(w, h, true);
+    if (found) return found;
+  }
+
+  // Pass 5: 800px upscale if small crop
+  if (maxDim < 800) {
+    const ratio = 800 / maxDim;
+    const w = Math.round(origW * ratio);
+    const h = Math.round(origH * ratio);
+    found = scanCanvas(w, h, false);
+    if (found) return found;
+  }
+
+  return null;
+}
+
+function normalizeQrUrl(rawDecoded) {
+  if (!rawDecoded || !rawDecoded.trim()) {
+    throw new Error('The scanned QR code is empty.');
+  }
+  let raw = rawDecoded.trim();
+  if (!raw.includes('://')) {
+    raw = `https://${raw}`;
+  }
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`The QR code decoded to "${rawDecoded}", which is not a valid web URL.`);
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname.includes('.')) {
+    throw new Error(`The QR code decoded to "${rawDecoded}". SENTINEL only scans web (HTTP/HTTPS) URLs.`);
+  }
+  return parsed.href;
+}
+
 function QrScanPage() {
   const [cameraOpen, setCameraOpen] = useState(false);
   const [cameraError, setCameraError] = useState('');
   const [qrValue, setQrValue] = useState('');
   const [fileBusy, setFileBusy] = useState(false);
+  const [uploadedPreview, setUploadedPreview] = useState(null);
   const scannerRef = useRef(null);
+  const resultRef = useRef(null);
   const scan = useScan();
+
+  // Scroll to results automatically when scanning or results arrive
+  useEffect(() => {
+    if (scan.result || scan.loading || scan.error) {
+      resultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }, [scan.result, scan.loading, scan.error]);
 
   useEffect(() => {
     if (!cameraOpen) return undefined;
@@ -264,22 +404,26 @@ function QrScanPage() {
       try {
         scanner = new Html5Qrcode('sentinel-qr-reader');
         scannerRef.current = scanner;
-        await scanner.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 230, height: 230 }, aspectRatio: 1 }, async (decoded) => {
-          if (cancelled) return;
-          setQrValue(decoded);
-          setCameraError('');
-          setCameraOpen(false);
-          try {
-            const parsed = new URL(decoded.trim());
-            if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error();
-            scan.analyzeUrl(parsed.href);
-          } catch {
-            setCameraError('This QR code does not contain a valid HTTP or HTTPS URL.');
-          }
-        }, () => {});
+        await scanner.start(
+          { facingMode: 'environment' },
+          { fps: 10, qrbox: { width: 230, height: 230 }, aspectRatio: 1 },
+          async (decoded) => {
+            if (cancelled) return;
+            setQrValue(decoded);
+            setCameraError('');
+            setCameraOpen(false);
+            try {
+              const validUrl = normalizeQrUrl(decoded);
+              scan.analyzeUrl(validUrl);
+            } catch (err) {
+              setCameraError(err.message || 'This QR code does not contain a valid HTTP or HTTPS URL.');
+            }
+          },
+          () => {}
+        );
       } catch {
         if (!cancelled) {
-          setCameraError('Camera unavailable. Allow camera access or upload a QR image instead.');
+          setCameraError('Camera unavailable. Allow camera access in browser permissions or upload a QR image instead.');
           setCameraOpen(false);
         }
       }
@@ -296,40 +440,55 @@ function QrScanPage() {
         })();
       }
     };
-    // scan is stable for the page lifetime; intentionally do not restart camera on result changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cameraOpen]);
 
   async function uploadFile(file) {
     if (!file) return;
     setCameraError('');
     setFileBusy(true);
-    let scanner;
+    setCameraOpen(false);
+
+    // Show image preview in the workspace
+    const previewUrl = URL.createObjectURL(file);
+    setUploadedPreview(previewUrl);
+
     try {
-      scanner = new Html5Qrcode('sentinel-qr-reader');
-      const decoded = await scanner.scanFile(file, true);
+      const decoded = await decodeQrFromImage(file);
+      if (!decoded) {
+        throw new Error('Could not detect a QR code in this image. Please ensure the QR code is clearly visible, or try using camera mode.');
+      }
+
       setQrValue(decoded);
-      const parsed = new URL(decoded.trim());
-      if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('The QR code does not contain an HTTP or HTTPS URL.');
-      scan.analyzeUrl(parsed.href);
+      const validUrl = normalizeQrUrl(decoded);
+      scan.analyzeUrl(validUrl);
     } catch (e) {
-      setCameraError(e.message || 'Could not read a QR code from that image. Try a clearer image.');
+      setCameraError(e.message || 'Could not decode QR code from this image.');
     } finally {
-      try { scanner?.clear(); } catch {}
       setFileBusy(false);
     }
   }
 
   return (
     <Layout wide>
-      <section className="qr-hero" style={{ backgroundImage: "linear-gradient(90deg, rgba(239,226,207,.96) 0%, rgba(239,226,207,.87) 39%, rgba(239,226,207,.05) 77%), url('/images/qr-camera.png')" }}>
+      <section
+        className="qr-hero"
+        style={{
+          backgroundImage:
+            "linear-gradient(90deg, #efe2cf 0%, #efe2cf 46%, rgba(239,226,207,.92) 58%, rgba(239,226,207,.08) 84%), url('/images/qr-camera.png')",
+        }}
+      >
         <div className="qr-hero-copy">
           <p className="eyebrow"><span className="eyebrow-line" /> QR SCAN / 02</p>
           <h1>Pause. Scan.<br /><em>Proceed.</em></h1>
           <p>Read the code. Check the destination. Choose with confidence.</p>
           <div className="qr-hero-actions">
-            <button className="button button-dark" onClick={() => { setCameraError(''); setCameraOpen(v => !v); }}><Camera size={17} />{cameraOpen ? 'CLOSE CAMERA' : 'OPEN CAMERA'} <ArrowRight size={16} /></button>
-            <label className="button button-light upload-button"><Upload size={17} /> UPLOAD QR IMAGE<input type="file" accept="image/*" onChange={e => uploadFile(e.target.files?.[0])} disabled={fileBusy} /></label>
+            <button className="button button-dark" onClick={() => { setCameraError(''); setCameraOpen(v => !v); }}>
+              <Camera size={17} />{cameraOpen ? 'CLOSE CAMERA' : 'OPEN CAMERA'} <ArrowRight size={16} />
+            </button>
+            <label className="button button-light upload-button">
+              <Upload size={17} /> UPLOAD QR IMAGE
+              <input type="file" accept="image/*" onChange={e => uploadFile(e.target.files?.[0])} disabled={fileBusy} />
+            </label>
           </div>
           <p className="scan-note"><LockKeyhole size={14} /> Decoded links are analyzed, never opened.</p>
         </div>
@@ -348,26 +507,60 @@ function QrScanPage() {
         </div>
         <div className="qr-camera-panel">
           <div id="sentinel-qr-reader" className={cameraOpen ? 'qr-reader' : 'qr-reader-hidden'} />
-          {!cameraOpen && (
+          {!cameraOpen && !uploadedPreview && (
             <div className="camera-placeholder">
               <div className="camera-frame"><ScanLine size={40} /></div>
               <strong>Ready when you are</strong>
               <span>Open the camera or upload a QR image to begin.</span>
             </div>
           )}
-          {(cameraError || fileBusy) && <p className={cameraError ? 'qr-error' : 'scan-note'} role="status">{fileBusy ? 'Reading QR image…' : cameraError}</p>}
-          {qrValue && !scan.result && <p className="decoded-url"><Check size={15} /> QR decoded: {qrValue}</p>}
+          {!cameraOpen && uploadedPreview && (
+            <div className="uploaded-preview-box">
+              <img src={uploadedPreview} alt="Uploaded QR preview" className="uploaded-preview-img" />
+              <span>Selected QR Image</span>
+            </div>
+          )}
+          {(cameraError || fileBusy) && (
+            <p className={cameraError ? 'qr-error' : 'scan-note qr-busy-note'} role="status">
+              {fileBusy ? <><LoaderCircle size={15} className="spin" /> Reading and analyzing QR code…</> : cameraError}
+            </p>
+          )}
+          {qrValue && (
+            <div className="decoded-qr-badge">
+              <Check size={16} />
+              <div>
+                <small>DECODED QR DESTINATION</small>
+                <strong>{qrValue}</strong>
+              </div>
+            </div>
+          )}
         </div>
       </section>
+
+      {/* Immediate Result Card Section - Positioned right below workspace just like URL Scan */}
+      <div ref={resultRef} className="qr-result-section">
+        {scan.error && <div className="notice error" role="alert">{scan.error}</div>}
+        {scan.loading && (
+          <div className="loading-panel">
+            <LoaderCircle className="spin" />
+            <span>Analyzing the decoded QR destination with the ML model and real-time host check…</span>
+          </div>
+        )}
+        <ResultCard
+          result={scan.result}
+          onReset={() => {
+            scan.reset();
+            setQrValue('');
+            setCameraError('');
+            setUploadedPreview(null);
+          }}
+        />
+      </div>
 
       <figure className="qr-reference-strip">
         <img src="/images/qr-realworld.jpg" alt="A person scanning a printed QR code with a smartphone on a warm wooden table" />
         <figcaption><span>SCAN WITH INTENTION</span><span>Always check the destination before opening it.</span></figcaption>
       </figure>
-
-      {scan.error && <div className="notice error" role="alert">{scan.error}</div>}
-      {scan.loading && <div className="loading-panel"><LoaderCircle className="spin" /> Analyzing the decoded URL with the trained model and real-time checks…</div>}
-      <ResultCard result={scan.result} onReset={() => { scan.reset(); setQrValue(''); }} />
     </Layout>
   );
 }

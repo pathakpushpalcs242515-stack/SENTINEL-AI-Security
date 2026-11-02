@@ -10,5 +10,4 @@ backend/data/*.db
 .DS_Store
 
 *.zip
-
-*.zip
+VIEW_DATABASE_DATA.*
